@@ -50,7 +50,6 @@ void sendProvisionStatus(int seq, const char* stage, int progress,
 unsigned long lastSensorReadMs = 0;
 unsigned long lastTcpAttemptMs = 0;
 unsigned long lastTcpHeartbeatMs = 0;
-unsigned long lastWifiAttemptMs = 0;
 AcCommandedState acCommandedState = AcCommandedState::Unknown;
 bool thermostatAutoEnabled = true;
 bool bleConnected = false;
@@ -85,6 +84,68 @@ String serialInput;
 NimBLEServer* bleServer = nullptr;
 NimBLECharacteristic* bleTxCharacteristic = nullptr;
 NimBLECharacteristic* bleRxCharacteristic = nullptr;
+
+void onWifiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
+  if (event != ARDUINO_EVENT_WIFI_STA_DISCONNECTED) return;
+
+  const uint8_t reason = info.wifi_sta_disconnected.reason;
+  if (reason == 8) return;
+  const char* hint = "Check the router, Wi-Fi band, and signal";
+  switch (reason) {
+    case 2:
+      hint = "Authentication expired; check password and router security";
+      break;
+    case 15:
+    case 204:
+      hint = "Handshake timed out; password may be wrong or signal weak";
+      break;
+    case 200:
+      hint = "Beacon timeout; signal weak or access point unavailable";
+      break;
+    case 201:
+      hint = "AP not found; check SSID, 2.4 GHz, signal, and password";
+      break;
+    case 202:
+      hint = "Authentication failed; check password and router security";
+      break;
+    case 210:
+    case 211:
+      hint = "No compatible access point; check router security settings";
+      break;
+    case 212:
+      hint = "Access point signal is below the minimum threshold";
+      break;
+  }
+
+  Serial.printf("Wi-Fi disconnect reason=%u: %s\n", reason, hint);
+}
+
+void scanWifiNetworks() {
+  wifiProvisioningPending = false;
+  wifiProvisionReady = false;
+  WiFi.setAutoReconnect(false);
+  WiFi.disconnect(true, false);
+  delay(100);
+  WiFi.mode(WIFI_STA);
+
+  Serial.println("Scanning nearby 2.4 GHz Wi-Fi networks...");
+  const int count = WiFi.scanNetworks(false, true);
+  if (count < 0) {
+    Serial.printf("Wi-Fi scan failed (%d)\n", count);
+  } else if (count == 0) {
+    Serial.println("No Wi-Fi networks found");
+  } else {
+    for (int i = 0; i < count; ++i) {
+      const String ssid = WiFi.SSID(i);
+      const bool openNetwork = WiFi.encryptionType(i) == WIFI_AUTH_OPEN;
+      Serial.printf("%2d. %s | RSSI %d dBm | %s\n", i + 1,
+                    ssid.c_str(), WiFi.RSSI(i),
+                    openNetwork ? "open" : "secured");
+    }
+  }
+  WiFi.scanDelete();
+  Serial.println("Send W to enter Wi-Fi credentials");
+}
 
 bool cloudCredentialsConfigured() {
   return bemfaPrivateKey.length() > 0 && bemfaTopic.length() > 0;
@@ -320,8 +381,11 @@ void sendProvisionError(const int seq, const int code, const char* reason) {
 void startWifiFromProvisioning() {
   wifiProvisionReady = true;
   wifiProvisionStartedMs = millis();
-  WiFi.disconnect();
+  WiFi.setAutoReconnect(false);
+  WiFi.disconnect(true, false);
+  delay(100);
   WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
   WiFi.begin(pendingWifiSsid.c_str(), pendingWifiPassword.c_str());
   sendProvisionStatus(++wifiProvisionSeq, "wifi_connecting", 40);
 }
@@ -329,20 +393,25 @@ void startWifiFromProvisioning() {
 void processSerialLine(const String& line) {
   if (serialProvisionStep == SerialProvisionStep::Command) {
     if (line.equalsIgnoreCase("w")) {
-      WiFi.disconnect();
+      WiFi.setAutoReconnect(false);
+      WiFi.disconnect(true, false);
       wifiProvisioningPending = false;
       serialProvisionStep = SerialProvisionStep::Ssid;
       Serial.println("Enter Wi-Fi SSID, then press Enter:");
+    } else if (line.equalsIgnoreCase("l")) {
+      scanWifiNetworks();
     } else if (line.equalsIgnoreCase("p")) {
       Serial.println("Starting Bemfa app provisioning mode");
       provisionFinished = false;
       provisionDoneSent = false;
       provisionRegistrationRequired = false;
       wifiProvisioningPending = false;
-      WiFi.disconnect();
+      WiFi.setAutoReconnect(false);
+      WiFi.disconnect(true, false);
       startBemfaBleProvisioning();
     } else if (!line.isEmpty()) {
-      Serial.println("Commands: W = Wi-Fi setup, P = Bemfa BLE provisioning");
+      Serial.println(
+          "Commands: L = scan Wi-Fi, W = Wi-Fi setup, P = Bemfa BLE provisioning");
     }
     return;
   }
@@ -561,6 +630,7 @@ void beginWifiProvisioning() {
   }
 
   WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
   WiFi.begin(pendingWifiSsid.c_str(), pendingWifiPassword.c_str());
 }
 
@@ -595,7 +665,11 @@ void processProvisioning() {
   if (millis() - wifiProvisionStartedMs > WIFI_PROVISION_TIMEOUT_MS) {
     wifiProvisioningPending = false;
     wifiProvisionReady = false;
-    Serial.println("Wi-Fi connection timed out; enter W to retry");
+    WiFi.setAutoReconnect(false);
+    WiFi.disconnect(true, false);
+    Serial.println(
+        "Wi-Fi connection timed out; check the disconnect reason above and "
+        "enter W to retry");
     sendProvisionStatus(++wifiProvisionSeq, "wifi_failed", 100, 1003,
                         "wifi_timeout");
   }
@@ -664,7 +738,8 @@ void setup() {
   Serial.println("ESP32-C3 IR A/C temperature controller ready");
   Serial.println("IR receive: GPIO0, IR transmit: GPIO1, DHT: GPIO2");
   Serial.println("DHT type: DHT22; ON above 28 C, OFF below 24 C");
-  Serial.println("Serial commands: W = Wi-Fi setup, P = Bemfa BLE provisioning");
+  Serial.println(
+      "Serial commands: L = scan Wi-Fi, W = Wi-Fi setup, P = Bemfa BLE provisioning");
 
   preferences.begin("irac", false);
   bemfaTopic = BEMFA_AC_TOPIC;
@@ -686,6 +761,7 @@ void setup() {
   mideaAc.begin();
   irReceiver.enableIRIn();
 
+  WiFi.onEvent(onWifiEvent);
   beginWifiProvisioning();
   if (!cloudCredentialsConfigured()) {
     Serial.println("Bemfa disabled: configure the private key and topic");
@@ -708,13 +784,6 @@ void loop() {
   }
 
   const unsigned long now = millis();
-  if (WiFi.status() != WL_CONNECTED && !wifiProvisioningPending &&
-      serialProvisionStep == SerialProvisionStep::Command &&
-      !pendingWifiSsid.isEmpty() &&
-      now - lastWifiAttemptMs >= 15000) {
-    lastWifiAttemptMs = now;
-    WiFi.begin(pendingWifiSsid.c_str(), pendingWifiPassword.c_str());
-  }
   if (!bemfaClient.connected() && cloudCredentialsConfigured() &&
       WiFi.status() == WL_CONNECTED &&
       now - lastTcpAttemptMs >= TCP_RETRY_INTERVAL_MS) {

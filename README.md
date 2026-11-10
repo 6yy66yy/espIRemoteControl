@@ -62,8 +62,17 @@ The provided A/C topic must be an existing Bemfa TCP topic ending in `005`.
    preferences; it is not requested over serial.
 
 The SSID must be 1-32 characters and the password at most 64 characters. Use a
-2.4 GHz Wi-Fi network. Serial commands are `W` for Wi-Fi setup and `P` for
-Bemfa BLE provisioning. The same commands work again later to change networks.
+2.4 GHz Wi-Fi network. Serial commands are `L` to scan nearby Wi-Fi networks,
+`W` for Wi-Fi setup, and `P` for Bemfa BLE provisioning. Scanning disconnects
+the current Wi-Fi attempt and prints each SSID, signal strength, and whether
+the network is open or secured. The scan does not show or store passwords.
+
+On connection failures, the serial log includes the ESP32 disconnect reason and
+a hint. Authentication failures suggest checking the password and router
+security; an AP-not-found result suggests checking the SSID, 2.4 GHz band,
+signal, and password. Handshake timeouts can be caused by either a wrong
+password or a weak signal. The sketch lets the Wi-Fi driver handle reconnects
+instead of repeatedly reapplying configuration while a connection is in flight.
 
 - The device connects to `bemfa.com:8344` using the TCP protocol. Send these
 payloads to the A/C topic's `/set`:
