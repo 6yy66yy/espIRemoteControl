@@ -1,0 +1,7 @@
+#pragma once
+
+// Copy this file to cloud_config.local.h and fill in your private key/topic.
+#define BEMFA_PRIVATE_KEY ""
+#define BEMFA_AC_TOPIC ""
+#define WIFI_SSID ""
+#define WIFI_PASSWORD ""
