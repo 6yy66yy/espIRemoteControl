@@ -34,6 +34,7 @@ constexpr char BEMFA_TX_UUID[] = "BEFA2002-BE35-4A5A-9C4A-BE0E02000000";
 #define DHT_TYPE DHT22
 
 enum class AcCommandedState : uint8_t { Unknown, Off, On };
+enum class SerialProvisionStep : uint8_t { Command, Ssid, Password };
 
 WiFiClient bemfaClient;
 DHT dht(DHT_PIN, DHT_TYPE);
@@ -64,6 +65,8 @@ bool provisionFinished = false;
 bool topicRegistrationPending = false;
 bool topicRegistrationSucceeded = false;
 bool cloudConnectingStatusPending = false;
+SerialProvisionStep serialProvisionStep = SerialProvisionStep::Command;
+bool serialInputOverflow = false;
 unsigned long wifiProvisionStartedMs = 0;
 unsigned long wifiStartDueMs = 0;
 unsigned long cloudStatusDueMs = 0;
@@ -78,6 +81,7 @@ String pendingWifiSsid;
 String pendingWifiPassword;
 String pendingCloudToken;
 String tcpInput;
+String serialInput;
 NimBLEServer* bleServer = nullptr;
 NimBLECharacteristic* bleTxCharacteristic = nullptr;
 NimBLECharacteristic* bleRxCharacteristic = nullptr;
@@ -322,6 +326,79 @@ void startWifiFromProvisioning() {
   sendProvisionStatus(++wifiProvisionSeq, "wifi_connecting", 40);
 }
 
+void processSerialLine(const String& line) {
+  if (serialProvisionStep == SerialProvisionStep::Command) {
+    if (line.equalsIgnoreCase("w")) {
+      WiFi.disconnect();
+      wifiProvisioningPending = false;
+      serialProvisionStep = SerialProvisionStep::Ssid;
+      Serial.println("Enter Wi-Fi SSID, then press Enter:");
+    } else if (line.equalsIgnoreCase("p")) {
+      Serial.println("Starting Bemfa app provisioning mode");
+      provisionFinished = false;
+      provisionDoneSent = false;
+      provisionRegistrationRequired = false;
+      wifiProvisioningPending = false;
+      WiFi.disconnect();
+      startBemfaBleProvisioning();
+    } else if (!line.isEmpty()) {
+      Serial.println("Commands: W = Wi-Fi setup, P = Bemfa BLE provisioning");
+    }
+    return;
+  }
+
+  if (serialInputOverflow) {
+    Serial.println("Input too long; serial Wi-Fi setup cancelled");
+    serialProvisionStep = SerialProvisionStep::Command;
+    return;
+  }
+
+  if (serialProvisionStep == SerialProvisionStep::Ssid) {
+    if (line.isEmpty() || line.length() > 32) {
+      Serial.println("SSID must be 1-32 characters; enter W to try again");
+      serialProvisionStep = SerialProvisionStep::Command;
+      return;
+    }
+    pendingWifiSsid = line;
+    serialProvisionStep = SerialProvisionStep::Password;
+    Serial.println("Enter Wi-Fi password, then press Enter (blank for open Wi-Fi):");
+    return;
+  }
+
+  if (line.length() > 64) {
+    Serial.println("Wi-Fi password must be 64 characters or fewer; enter W to retry");
+    serialProvisionStep = SerialProvisionStep::Command;
+    return;
+  }
+
+  pendingWifiPassword = line;
+  pendingCloudToken = preferences.getString("token", BEMFA_PRIVATE_KEY);
+  if (pendingCloudToken.isEmpty()) pendingCloudToken = BEMFA_PRIVATE_KEY;
+  wifiProvisioningPending = true;
+  wifiProvisionReady = false;
+  wifiStartDueMs = millis();
+  firstAppWifiConfig = false;
+  serialProvisionStep = SerialProvisionStep::Command;
+  Serial.println("Connecting to Wi-Fi; credentials are not printed");
+}
+
+void processSerialInput() {
+  while (Serial.available()) {
+    const char c = static_cast<char>(Serial.read());
+    if (c == '\r') continue;
+
+    if (c == '\n') {
+      processSerialLine(serialInput);
+      serialInput = "";
+      serialInputOverflow = false;
+    } else if (serialInput.length() < 64) {
+      serialInput += c;
+    } else {
+      serialInputOverflow = true;
+    }
+  }
+}
+
 class BemfaBleServerCallbacks : public NimBLEServerCallbacks {
   void onConnect(NimBLEServer*, NimBLEConnInfo&) override {
     bleConnected = true;
@@ -518,6 +595,7 @@ void processProvisioning() {
   if (millis() - wifiProvisionStartedMs > WIFI_PROVISION_TIMEOUT_MS) {
     wifiProvisioningPending = false;
     wifiProvisionReady = false;
+    Serial.println("Wi-Fi connection timed out; enter W to retry");
     sendProvisionStatus(++wifiProvisionSeq, "wifi_failed", 100, 1003,
                         "wifi_timeout");
   }
@@ -586,6 +664,7 @@ void setup() {
   Serial.println("ESP32-C3 IR A/C temperature controller ready");
   Serial.println("IR receive: GPIO0, IR transmit: GPIO1, DHT: GPIO2");
   Serial.println("DHT type: DHT22; ON above 28 C, OFF below 24 C");
+  Serial.println("Serial commands: W = Wi-Fi setup, P = Bemfa BLE provisioning");
 
   preferences.begin("irac", false);
   bemfaTopic = BEMFA_AC_TOPIC;
@@ -630,6 +709,7 @@ void loop() {
 
   const unsigned long now = millis();
   if (WiFi.status() != WL_CONNECTED && !wifiProvisioningPending &&
+      serialProvisionStep == SerialProvisionStep::Command &&
       !pendingWifiSsid.isEmpty() &&
       now - lastWifiAttemptMs >= 15000) {
     lastWifiAttemptMs = now;
@@ -674,16 +754,5 @@ void loop() {
     irReceiver.resume();
   }
 
-  if (Serial.available()) {
-    const char command = static_cast<char>(Serial.read());
-    if (command == 'p' || command == 'P') {
-      Serial.println("Starting Bemfa app provisioning mode");
-      provisionFinished = false;
-      provisionDoneSent = false;
-      provisionRegistrationRequired = false;
-      wifiProvisioningPending = false;
-      WiFi.disconnect();
-      startBemfaBleProvisioning();
-    }
-  }
+  processSerialInput();
 }

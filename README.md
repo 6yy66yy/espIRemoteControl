@@ -50,8 +50,20 @@ send the Wi-Fi credentials and account token. The device saves them locally,
 registers the configured topic with Bemfa, and connects to the TCP device cloud.
 The provided A/C topic must be an existing Bemfa TCP topic ending in `005`.
 
-After Wi-Fi is saved, reopen provisioning by sending `P` in Serial Monitor at
-115200 baud. This is useful when changing routers or re-pairing the app.
+### Configure Wi-Fi over USB serial
+
+1. Open Serial Monitor for the ESP32-C3 at **115200 baud** and select **Newline**
+   as the line ending.
+2. Send `W`.
+3. Enter the Wi-Fi SSID and password on separate lines. Leave the password empty
+   for an open network.
+4. The device connects and saves credentials to ESP32 Preferences. The Bemfa
+   private key is read from the ignored local config or the previously saved
+   preferences; it is not requested over serial.
+
+The SSID must be 1-32 characters and the password at most 64 characters. Use a
+2.4 GHz Wi-Fi network. Serial commands are `W` for Wi-Fi setup and `P` for
+Bemfa BLE provisioning. The same commands work again later to change networks.
 
 - The device connects to `bemfa.com:8344` using the TCP protocol. Send these
 payloads to the A/C topic's `/set`:
