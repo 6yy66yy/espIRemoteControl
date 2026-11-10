@@ -23,12 +23,12 @@ bare IR LED. Do not drive a bare IR LED directly from the ESP32-C3 GPIO.
 All modules must share a common ground.
 
 The sketch defaults to DHT22. If your sensor is DHT11, change
-`#define DHT_TYPE DHT22` to `#define DHT_TYPE DHT11` in the sketch.
+`DHT_TYPE = 22` to `DHT_TYPE = 11` in the sketch.
 
 ## Arduino IDE
 
 1. Install the Espressif ESP32 board package.
-2. Install **IRremoteESP8266**, **DHT sensor library**, **ArduinoJson**, and
+2. Install **IRremoteESP8266**, **DHTNEW** (tested with 0.5.5), **ArduinoJson**, and
    **NimBLE-Arduino** from Library Manager.
 3. Open `ir_receive_demo/ir_receive_demo.ino`.
 4. Select the matching ESP32-C3 board (for a generic board, use **ESP32C3 Dev Module**).
@@ -39,6 +39,8 @@ Received IR messages are logged as hex, bit count, and protocol number only.
 Temperature and humidity are printed every two seconds. The automatic cooling
 command sets 26 C and automatic fan. Cloud set temperatures are clamped to
 17-30 C; cooling and heating use automatic fan.
+Sensor pulse waits have timeouts; failed readings are logged and do not change
+the commanded A/C state.
 
 ## Bemfa Cloud App Provisioning
 
@@ -64,15 +66,23 @@ The provided A/C topic must be an existing Bemfa TCP topic ending in `005`.
 The SSID must be 1-32 characters and the password at most 64 characters. Use a
 2.4 GHz Wi-Fi network. Serial commands are `L` to scan nearby Wi-Fi networks,
 `W` for Wi-Fi setup, and `P` for Bemfa BLE provisioning. Scanning disconnects
-the current Wi-Fi attempt and prints each SSID, signal strength, and whether
-the network is open or secured. The scan does not show or store passwords.
+the current Wi-Fi attempt and prints each SSID, signal strength, channel, and
+security mode. The scan does not show or store passwords.
 
 On connection failures, the serial log includes the ESP32 disconnect reason and
-a hint. Authentication failures suggest checking the password and router
-security; an AP-not-found result suggests checking the SSID, 2.4 GHz band,
-signal, and password. Handshake timeouts can be caused by either a wrong
+a hint. Reason 2 means authentication timed out or the AP reported AUTH_EXPIRE;
+it does not establish that the password is wrong. An AP-not-found result suggests
+checking the SSID, 2.4 GHz band, signal, and password. Handshake timeouts can be
+caused by either a wrong
 password or a weak signal. The sketch lets the Wi-Fi driver handle reconnects
 instead of repeatedly reapplying configuration while a connection is in flight.
+
+The tested ESP32-C3 SuperMini repeatedly failed authentication at its default
+20 dBm transmit power and connected at 8.5 dBm with the same credentials.
+`WIFI_TX_POWER` sets this limit after each Wi-Fi restart, for both saved
+credentials and serial/BLE provisioning. Adjust it for a different board only
+after testing connection stability; lower power can reduce range. Successful
+connections print the IP address and signal strength.
 
 - The device connects to `bemfa.com:8344` using the TCP protocol. Send these
 payloads to the A/C topic's `/set`:

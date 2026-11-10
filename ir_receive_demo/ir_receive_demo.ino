@@ -3,7 +3,7 @@
 #include <IRremoteESP8266.h>
 #include <ir_Midea.h>
 #include <ArduinoJson.h>
-#include <DHT.h>
+#include <dhtnew.h>
 #include <HTTPClient.h>
 #include <NimBLEDevice.h>
 #include <Preferences.h>
@@ -24,20 +24,23 @@ constexpr unsigned long SENSOR_READ_INTERVAL_MS = 2000;
 constexpr unsigned long TCP_RETRY_INTERVAL_MS = 5000;
 constexpr unsigned long TCP_HEARTBEAT_INTERVAL_MS = 60000;
 constexpr unsigned long WIFI_PROVISION_TIMEOUT_MS = 90000;
+// This SuperMini repeatedly failed authentication at 20 dBm and connected at
+// 8.5 dBm. Keep this configurable for boards with different radio hardware.
+constexpr wifi_power_t WIFI_TX_POWER = WIFI_POWER_8_5dBm;
 constexpr uint16_t BEMFA_TCP_PORT = 8344;
 constexpr char BEMFA_TCP_HOST[] = "bemfa.com";
 constexpr char BEMFA_SERVICE_UUID[] = "BEFA2000-BE35-4A5A-9C4A-BE0E02000000";
 constexpr char BEMFA_RX_UUID[] = "BEFA2001-BE35-4A5A-9C4A-BE0E02000000";
 constexpr char BEMFA_TX_UUID[] = "BEFA2002-BE35-4A5A-9C4A-BE0E02000000";
 
-// Select the sensor model wired to GPIO2: use DHT11 for a DHT11 module.
-#define DHT_TYPE DHT22
+// Select the sensor model wired to GPIO2: 22 = DHT22, 11 = DHT11.
+constexpr uint8_t DHT_TYPE = 22;
 
 enum class AcCommandedState : uint8_t { Unknown, Off, On };
 enum class SerialProvisionStep : uint8_t { Command, Ssid, Password };
 
 WiFiClient bemfaClient;
-DHT dht(DHT_PIN, DHT_TYPE);
+DHTNEW dht(DHT_PIN);
 Preferences preferences;
 IRrecv irReceiver(
     IR_RECEIVE_PIN, CAPTURE_BUFFER_SIZE, CAPTURE_TIMEOUT_MS, true);
@@ -85,7 +88,40 @@ NimBLEServer* bleServer = nullptr;
 NimBLECharacteristic* bleTxCharacteristic = nullptr;
 NimBLECharacteristic* bleRxCharacteristic = nullptr;
 
+const char* wifiAuthName(wifi_auth_mode_t auth) {
+  switch (auth) {
+    case WIFI_AUTH_OPEN: return "OPEN";
+    case WIFI_AUTH_WEP: return "WEP";
+    case WIFI_AUTH_WPA_PSK: return "WPA";
+    case WIFI_AUTH_WPA2_PSK: return "WPA2";
+    case WIFI_AUTH_WPA_WPA2_PSK: return "WPA/WPA2";
+    case WIFI_AUTH_WPA2_ENTERPRISE: return "WPA2-ENTERPRISE";
+    case WIFI_AUTH_WPA3_PSK: return "WPA3";
+    case WIFI_AUTH_WPA2_WPA3_PSK: return "WPA2/WPA3";
+    default: return "OTHER";
+  }
+}
+
+void configureWifiStation() {
+  WiFi.mode(WIFI_STA);
+  // Apply after every Wi-Fi restart, including serial and BLE provisioning.
+  if (!WiFi.setTxPower(WIFI_TX_POWER)) {
+    Serial.println("Could not apply Wi-Fi TX power limit");
+  }
+}
+
 void onWifiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
+  if (event == ARDUINO_EVENT_WIFI_STA_CONNECTED) {
+    Serial.printf("Wi-Fi associated: channel=%u, security=%s\n",
+                  info.wifi_sta_connected.channel,
+                  wifiAuthName(info.wifi_sta_connected.authmode));
+    return;
+  }
+  if (event == ARDUINO_EVENT_WIFI_STA_GOT_IP) {
+    Serial.printf("Wi-Fi connected: IP=%s, RSSI=%d dBm\n",
+                  WiFi.localIP().toString().c_str(), WiFi.RSSI());
+    return;
+  }
   if (event != ARDUINO_EVENT_WIFI_STA_DISCONNECTED) return;
 
   const uint8_t reason = info.wifi_sta_disconnected.reason;
@@ -93,7 +129,7 @@ void onWifiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
   const char* hint = "Check the router, Wi-Fi band, and signal";
   switch (reason) {
     case 2:
-      hint = "Authentication expired; check password and router security";
+      hint = "Authentication timed out or AP sent AUTH_EXPIRE";
       break;
     case 15:
     case 204:
@@ -126,7 +162,7 @@ void scanWifiNetworks() {
   WiFi.setAutoReconnect(false);
   WiFi.disconnect(true, false);
   delay(100);
-  WiFi.mode(WIFI_STA);
+  configureWifiStation();
 
   Serial.println("Scanning nearby 2.4 GHz Wi-Fi networks...");
   const int count = WiFi.scanNetworks(false, true);
@@ -137,10 +173,9 @@ void scanWifiNetworks() {
   } else {
     for (int i = 0; i < count; ++i) {
       const String ssid = WiFi.SSID(i);
-      const bool openNetwork = WiFi.encryptionType(i) == WIFI_AUTH_OPEN;
-      Serial.printf("%2d. %s | RSSI %d dBm | %s\n", i + 1,
+      Serial.printf("%2d. %s | RSSI %d dBm | channel %d | %s\n", i + 1,
                     ssid.c_str(), WiFi.RSSI(i),
-                    openNetwork ? "open" : "secured");
+                    WiFi.channel(i), wifiAuthName(WiFi.encryptionType(i)));
     }
   }
   WiFi.scanDelete();
@@ -384,7 +419,7 @@ void startWifiFromProvisioning() {
   WiFi.setAutoReconnect(false);
   WiFi.disconnect(true, false);
   delay(100);
-  WiFi.mode(WIFI_STA);
+  configureWifiStation();
   WiFi.setAutoReconnect(true);
   WiFi.begin(pendingWifiSsid.c_str(), pendingWifiPassword.c_str());
   sendProvisionStatus(++wifiProvisionSeq, "wifi_connecting", 40);
@@ -629,7 +664,7 @@ void beginWifiProvisioning() {
     return;
   }
 
-  WiFi.mode(WIFI_STA);
+  configureWifiStation();
   WiFi.setAutoReconnect(true);
   WiFi.begin(pendingWifiSsid.c_str(), pendingWifiPassword.c_str());
 }
@@ -737,7 +772,7 @@ void setup() {
   Serial.println();
   Serial.println("ESP32-C3 IR A/C temperature controller ready");
   Serial.println("IR receive: GPIO0, IR transmit: GPIO1, DHT: GPIO2");
-  Serial.println("DHT type: DHT22; ON above 28 C, OFF below 24 C");
+  Serial.printf("DHT type: DHT%u\n", DHT_TYPE);
   Serial.println(
       "Serial commands: L = scan Wi-Fi, W = Wi-Fi setup, P = Bemfa BLE provisioning");
 
@@ -757,7 +792,9 @@ void setup() {
   Serial.printf("Active thresholds: ON above %.1f C, OFF below %.1f C\n",
                 coolOnThresholdC, acOffThresholdC);
 
-  dht.begin();
+  // DHTNEW bounds pulse waits in microseconds; a missing pulse must not hold
+  // interrupts off long enough to trigger the ESP32-C3 interrupt watchdog.
+  dht.setType(DHT_TYPE);
   mideaAc.begin();
   irReceiver.enableIRIn();
 
@@ -792,12 +829,14 @@ void loop() {
   }
 
   if (now - lastSensorReadMs >= SENSOR_READ_INTERVAL_MS) {
-    lastSensorReadMs = now;
-    const float humidity = dht.readHumidity();
-    const float temperature = dht.readTemperature();
+    const int sensorStatus = dht.read();
+    lastSensorReadMs = millis();
+    const float humidity = dht.getHumidity();
+    const float temperature = dht.getTemperature();
 
-    if (isnan(temperature) || isnan(humidity)) {
-      Serial.println("DHT read failed; check sensor type and wiring");
+    if (sensorStatus != DHTLIB_OK || isnan(temperature) || isnan(humidity)) {
+      Serial.printf("DHT read failed (%d); check sensor type and wiring\n",
+                    sensorStatus);
     } else {
       Serial.printf("Temperature: %.1f C, humidity: %.1f%%\n",
                     temperature, humidity);
