@@ -8,6 +8,7 @@
 #include <NimBLEDevice.h>
 #include <Preferences.h>
 #include <WiFi.h>
+#include "ac_control.h"
 #include "cloud_config.h"
 
 constexpr uint16_t IR_RECEIVE_PIN = 0;
@@ -36,7 +37,6 @@ constexpr char BEMFA_TX_UUID[] = "BEFA2002-BE35-4A5A-9C4A-BE0E02000000";
 // Select the sensor model wired to GPIO2: 22 = DHT22, 11 = DHT11.
 constexpr uint8_t DHT_TYPE = 22;
 
-enum class AcCommandedState : uint8_t { Unknown, Off, On };
 enum class SerialProvisionStep : uint8_t { Command, Ssid, Password };
 
 WiFiClient bemfaClient;
@@ -53,8 +53,7 @@ void sendProvisionStatus(int seq, const char* stage, int progress,
 unsigned long lastSensorReadMs = 0;
 unsigned long lastTcpAttemptMs = 0;
 unsigned long lastTcpHeartbeatMs = 0;
-AcCommandedState acCommandedState = AcCommandedState::Unknown;
-bool thermostatAutoEnabled = true;
+AcState acState;
 bool bleConnected = false;
 bool bleTxSubscribed = false;
 bool wifiProvisioningPending = false;
@@ -74,8 +73,6 @@ unsigned long wifiStartDueMs = 0;
 unsigned long cloudStatusDueMs = 0;
 int wifiProvisionSeq = 0;
 int pendingHelloSeq = -1;
-uint8_t commandedMode = kMideaACCool;
-uint8_t commandedTempC = 26;
 
 String bemfaPrivateKey;
 String bemfaTopic;
@@ -186,23 +183,27 @@ bool cloudCredentialsConfigured() {
   return bemfaPrivateKey.length() > 0 && bemfaTopic.length() > 0;
 }
 
-uint8_t cloudModeToMidea(const int cloudMode) {
-  return cloudMode == 3 ? kMideaACHeat : kMideaACCool;
+const char* acModeName() {
+  return acState.mode == AcMode::Heat ? "HEAT" : "COOL";
 }
 
-int mideaModeToCloud(const uint8_t mode) {
-  return mode == kMideaACHeat ? 3 : 2;
+void printAcStatus() {
+  const char* power = acState.power == AcPower::On ? "ON" :
+                      acState.power == AcPower::Off ? "OFF" : "UNKNOWN";
+  Serial.printf("A/C commanded state: %s, %s, %u C, control=%s\n",
+                power, acModeName(), acState.temperatureC,
+                acState.automatic ? "AUTO" : "MANUAL");
 }
 
 void publishAcStatus() {
   if (!bemfaClient.connected()) return;
 
   String status;
-  if (acCommandedState == AcCommandedState::Off) {
+  if (acState.power == AcPower::Off) {
     status = "off";
-  } else if (acCommandedState == AcCommandedState::On) {
-    status = "on#" + String(mideaModeToCloud(commandedMode)) + "#" +
-             String(commandedTempC) + "#0";
+  } else if (acState.power == AcPower::On) {
+    status = "on#" + String(static_cast<uint8_t>(acState.mode)) + "#" +
+             String(acState.temperatureC) + "#0";
   } else {
     status = "unknown";
   }
@@ -265,74 +266,51 @@ void registerBemfaTopic() {
   }
 }
 
-void sendCoolingCommand() {
+void sendOnCommand() {
   mideaAc.setUseCelsius(true);
-  mideaAc.setMode(commandedMode);
-  mideaAc.setTemp(commandedTempC, true);
+  mideaAc.setMode(acState.mode == AcMode::Heat ? kMideaACHeat : kMideaACCool);
+  mideaAc.setTemp(acState.temperatureC, true);
   mideaAc.setFan(kMideaACFanAuto);
   mideaAc.on();
+  // Ignore our own emitter while transmitting; resume external reception after.
+  irReceiver.pause();
   mideaAc.send();
+  irReceiver.resume();
 
-  Serial.println("Sent Midea A/C ON command");
-  acCommandedState = AcCommandedState::On;
+  Serial.printf("Sent Midea A/C: ON, %s, %u C, fan=AUTO\n",
+                acModeName(), acState.temperatureC);
+  acState.power = AcPower::On;
   publishAcStatus();
 }
 
 void sendOffCommand() {
   mideaAc.off();
+  irReceiver.pause();
   mideaAc.send();
+  irReceiver.resume();
 
   Serial.println("Sent Midea A/C command: OFF");
-  acCommandedState = AcCommandedState::Off;
+  acState.power = AcPower::Off;
   publishAcStatus();
 }
 
-void handleBemfaCommand(const char* payload) {
-  String command(payload);
-  command.trim();
-  command.toLowerCase();
-
-  if (command == "auto") {
-    thermostatAutoEnabled = true;
-    Serial.println("Thermostat automatic mode enabled");
-    publishAcStatus();
+void handleAcCommand(const char* payload) {
+  AcCommand command;
+  if (!parseAcCommand(payload, command)) {
+    Serial.println(
+        "Invalid A/C command; use ON, OFF, COOL 26, HEAT 22, TEMP 24, AUTO, STATUS");
     return;
   }
 
-  thermostatAutoEnabled = false;
-  if (command == "off") {
+  const AcTransmission transmission = applyAcCommand(command, acState);
+  if (transmission == AcTransmission::On) {
+    sendOnCommand();
+  } else if (transmission == AcTransmission::Off) {
     sendOffCommand();
-    return;
+  } else {
+    publishAcStatus();
   }
-
-  if (!command.startsWith("on")) {
-    Serial.println("Unsupported Bemfa command: " + command);
-    return;
-  }
-
-  commandedMode = kMideaACCool;
-  commandedTempC = 26;
-  int fieldStart = command.indexOf('#');
-  if (fieldStart >= 0) {
-    String fields[6];
-    uint8_t fieldCount = 0;
-    while (fieldStart >= 0 && fieldCount < 6) {
-      const int next = command.indexOf('#', fieldStart + 1);
-      fields[fieldCount++] = command.substring(
-          fieldStart + 1, next < 0 ? command.length() : next);
-      fieldStart = next;
-    }
-
-    if (fieldCount > 0 && fields[0].length() > 0) {
-      commandedMode = cloudModeToMidea(fields[0].toInt());
-    }
-    if (fieldCount > 1 && fields[1].length() > 0) {
-      commandedTempC = static_cast<uint8_t>(
-          constrain(fields[1].toInt(), 17, 30));
-    }
-  }
-
-  sendCoolingCommand();
+  printAcStatus();
 }
 
 void handleThresholdCommand(const char* payload) {
@@ -426,6 +404,12 @@ void startWifiFromProvisioning() {
 }
 
 void processSerialLine(const String& line) {
+  if (serialInputOverflow) {
+    Serial.println("Input too long; command ignored, serial Wi-Fi setup cancelled");
+    serialProvisionStep = SerialProvisionStep::Command;
+    return;
+  }
+
   if (serialProvisionStep == SerialProvisionStep::Command) {
     if (line.equalsIgnoreCase("w")) {
       WiFi.setAutoReconnect(false);
@@ -444,16 +428,14 @@ void processSerialLine(const String& line) {
       WiFi.setAutoReconnect(false);
       WiFi.disconnect(true, false);
       startBemfaBleProvisioning();
-    } else if (!line.isEmpty()) {
+    } else if (line.equalsIgnoreCase("help") || line == "?") {
       Serial.println(
-          "Commands: L = scan Wi-Fi, W = Wi-Fi setup, P = Bemfa BLE provisioning");
+          "Wi-Fi: L = scan, W = setup, P = Bemfa BLE provisioning");
+      Serial.println(
+          "A/C: ON, OFF, COOL [17-30], HEAT [17-30], TEMP <17-30>, AUTO, STATUS");
+    } else if (!line.isEmpty()) {
+      handleAcCommand(line.c_str());
     }
-    return;
-  }
-
-  if (serialInputOverflow) {
-    Serial.println("Input too long; serial Wi-Fi setup cancelled");
-    serialProvisionStep = SerialProvisionStep::Command;
     return;
   }
 
@@ -729,7 +711,7 @@ void connectBemfaTcp() {
                      bemfaPrivateKey.c_str(), bemfaTopic.c_str());
   lastTcpHeartbeatMs = millis();
   Serial.println("Connected to Bemfa TCP cloud");
-  if (acCommandedState != AcCommandedState::Unknown) publishAcStatus();
+  if (acState.power != AcPower::Unknown) publishAcStatus();
   publishThresholds();
 }
 
@@ -747,7 +729,7 @@ void processBemfaTcp() {
         if (command.startsWith("threshold#")) {
           handleThresholdCommand(command.c_str());
         } else {
-          handleBemfaCommand(command.c_str());
+          handleAcCommand(command.c_str());
         }
       }
       tcpInput = "";
@@ -775,6 +757,8 @@ void setup() {
   Serial.printf("DHT type: DHT%u\n", DHT_TYPE);
   Serial.println(
       "Serial commands: L = scan Wi-Fi, W = Wi-Fi setup, P = Bemfa BLE provisioning");
+  Serial.println(
+      "A/C: ON, OFF, COOL 26, HEAT 22, TEMP 24, AUTO, STATUS; HELP for commands");
 
   preferences.begin("irac", false);
   bemfaTopic = BEMFA_AC_TOPIC;
@@ -841,14 +825,15 @@ void loop() {
       Serial.printf("Temperature: %.1f C, humidity: %.1f%%\n",
                     temperature, humidity);
 
-      if (thermostatAutoEnabled) {
+      if (acState.automatic) {
         if (temperature > coolOnThresholdC &&
-            acCommandedState != AcCommandedState::On) {
-          commandedMode = kMideaACCool;
-          commandedTempC = 26;
-          sendCoolingCommand();
+            (acState.power != AcPower::On || acState.mode != AcMode::Cool ||
+             acState.temperatureC != 26)) {
+          acState.mode = AcMode::Cool;
+          acState.temperatureC = 26;
+          sendOnCommand();
         } else if (temperature < acOffThresholdC &&
-                   acCommandedState != AcCommandedState::Off) {
+                   acState.power != AcPower::Off) {
           sendOffCommand();
         }
       }

@@ -42,6 +42,44 @@ command sets 26 C and automatic fan. Cloud set temperatures are clamped to
 Sensor pulse waits have timeouts; failed readings are logged and do not change
 the commanded A/C state.
 
+### A/C commands over USB serial
+
+Send one command per line at **115200 baud**, with **Newline** selected.
+These commands also work as Bemfa message payloads.
+
+| Command | Action |
+| --- | --- |
+| `COOL 26` | Turn on cooling at 26 C |
+| `HEAT 22` | Turn on heating at 22 C |
+| `TEMP 24` | Change the setpoint to 24 C; retain the current mode and power |
+| `ON` | Turn on with the most recently selected mode and setpoint |
+| `OFF` | Turn off |
+| `AUTO` | Resume temperature-based automatic cooling |
+| `STATUS` | Print commanded power, mode, setpoint, and AUTO/MANUAL |
+| `HELP` | Print serial commands |
+
+`COOL` and `HEAT` without a temperature retain the last setpoint. Valid integer
+temperatures are clamped to 17-30 C. A manual power, mode, or temperature command
+pauses the automatic thermostat until `AUTO` is sent. `TEMP` while off only
+updates the next setpoint; it does not turn on the A/C. Invalid commands leave
+the settings and automatic thermostat unchanged.
+
+After a reboot, automatic cooling is enabled with a 26 C cooling setpoint; power
+starts as unknown until this device sends an IR command. `AUTO` applies the
+configured thresholds at the next valid sensor reading. Between the two
+thresholds, it retains the last commanded state.
+
+### Reduced IR build
+
+`ir_receive_demo/build_opt.h` applies library compiler flags through the ESP32
+Arduino core. It disables other IR protocols and retains only **Midea 48-bit
+sending/decoding** and **unknown-code hash reception**. Cooling, heating,
+17-30 C adjustment, and explicit ON/OFF remain available. Other remotes are
+printed as unknown hexadecimal hashes, not their original full IR data.
+Do not remove this file when copying the sketch. No changes to the globally
+installed IR library are needed. Wi-Fi, Bemfa BLE provisioning, and the DHT
+sensor remain enabled.
+
 ## Bemfa Cloud App Provisioning
 
 Install **ArduinoJson** and **NimBLE-Arduino** from Library Manager. The ignored
@@ -89,9 +127,11 @@ payloads to the A/C topic's `/set`:
 - `on#2#26#0`: cooling on, 26 C, automatic fan.
 - `on#3#22#0`: heating on, 22 C, automatic fan.
 - `off`: turn the A/C off.
+- `on`: turn on with the last selected mode and setpoint.
 - `auto`: return to sensor-based automatic control.
 - `on#<mode>#<temperature>#0`: mode `2` is Cool, mode `3` is Heat; fan is
-  always automatic.
+  always automatic. Empty mode or temperature fields retain their last values.
+  Optional Bemfa fan/swing fields are accepted but do not change the IR settings.
 
 Send `threshold#28#24` to the A/C topic's `/set` to set the ON threshold to
 28 C and the OFF threshold to 24 C. Values must be between -10 C and 50 C, with
@@ -104,3 +144,11 @@ received or acted on a command.
 
 If the board uploads but no serial output appears over its native USB port,
 enable **USB CDC On Boot** in the board options, then upload again.
+
+## Native Regression Tests
+
+Run `.\tests\run.ps1` with MinGW g++ and IRremoteESP8266 installed. Optional
+`-Compiler` and `-IrLibrary` parameters select other installation paths.
+The tests cover serial/cloud parsing, state preservation, invalid commands,
+temperature limits, all 17-30 C cooling/heating ON/OFF frames decoded from
+simulated IR pulses, and unknown-code hash reception. They do not transmit IR.
