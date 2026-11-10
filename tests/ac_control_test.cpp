@@ -4,6 +4,8 @@
 #include "ir_Midea.h"
 #include "IRsend_test.h"
 
+void testRules();
+
 void check(bool condition, const char* message) {
   if (condition) return;
   std::cerr << "FAIL: " << message << '\n';
@@ -115,5 +117,6 @@ void testMideaFrames() {
 
 int main() {
   testCommands();
+  testRules();
   testMideaFrames();
 }

@@ -1,6 +1,7 @@
 param(
   [string]$Compiler = "C:\mingw64\bin\g++.exe",
-  [string]$IrLibrary = "$env:USERPROFILE\Documents\Arduino\libraries\IRremoteESP8266"
+  [string]$IrLibrary = "$env:USERPROFILE\Documents\Arduino\libraries\IRremoteESP8266",
+  [string]$JsonLibrary = "$env:USERPROFILE\Documents\Arduino\libraries\ArduinoJson"
 )
 
 $ErrorActionPreference = "Stop"
@@ -12,8 +13,9 @@ $testSources = "IRsend.cpp", "IRrecv.cpp", "IRtimer.cpp", "IRutils.cpp",
                "IRtext.cpp", "ir_Midea.cpp"
 $testSources = $testSources | ForEach-Object { Join-Path $IrLibrary "src\$_" }
 & $Compiler -std=c++11 -DUNIT_TEST @protocolFlags `
-  "-I$IrLibrary\src" "-I$IrLibrary\test" -ffunction-sections -fdata-sections `
-  (Join-Path $PSScriptRoot "ac_control_test.cpp") @testSources `
+  "-I$IrLibrary\src" "-I$IrLibrary\test" "-I$JsonLibrary\src" -ffunction-sections -fdata-sections `
+  (Join-Path $PSScriptRoot "ac_control_test.cpp") `
+  (Join-Path $PSScriptRoot "rule_engine_test.cpp") @testSources `
   "-Wl,--gc-sections" -o $testExe
 if ($LASTEXITCODE -ne 0) { throw "Native test compilation failed" }
 & $testExe

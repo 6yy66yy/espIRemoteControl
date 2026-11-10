@@ -8,19 +8,17 @@
 #include <NimBLEDevice.h>
 #include <Preferences.h>
 #include <WiFi.h>
+#include <WebServer.h>
 #include "ac_control.h"
 #include "cloud_config.h"
+#include "rules_config.h"
+#include "web_page.h"
 
 constexpr uint16_t IR_RECEIVE_PIN = 0;
 constexpr uint16_t IR_SEND_PIN = 1;
 constexpr uint16_t DHT_PIN = 2;
 constexpr uint16_t CAPTURE_BUFFER_SIZE = 512;
 constexpr uint8_t CAPTURE_TIMEOUT_MS = 50;
-// Defaults can be changed remotely with threshold#<on C>#<off C>.
-float coolOnThresholdC = 28.0f;
-float acOffThresholdC = 24.0f;
-// Between the thresholds, keep the last commanded A/C state to prevent rapid
-// on/off cycling.
 constexpr unsigned long SENSOR_READ_INTERVAL_MS = 2000;
 constexpr unsigned long TCP_RETRY_INTERVAL_MS = 5000;
 constexpr unsigned long TCP_HEARTBEAT_INTERVAL_MS = 60000;
@@ -54,6 +52,20 @@ unsigned long lastSensorReadMs = 0;
 unsigned long lastTcpAttemptMs = 0;
 unsigned long lastTcpHeartbeatMs = 0;
 AcState acState;
+RuleEngine ruleEngine;
+WebServer webServer(80);
+bool webStarted = false;
+bool sensorValid = false;
+bool sensorHasReading = false;
+float sensorTemperatureC = NAN;
+float sensorHumidity = NAN;
+int sensorError = -1;
+unsigned long lastValidSensorMs = 0;
+bool hasLastRule = false;
+TemperatureRule lastRule;
+unsigned long lastRuleMs = 0;
+bool lastRuleSent = false;
+String rulesWarning;
 bool bleConnected = false;
 bool bleTxSubscribed = false;
 bool wifiProvisioningPending = false;
@@ -84,6 +96,8 @@ String serialInput;
 NimBLEServer* bleServer = nullptr;
 NimBLECharacteristic* bleTxCharacteristic = nullptr;
 NimBLECharacteristic* bleRxCharacteristic = nullptr;
+
+bool persistRules(const RuleSet& candidate, String& error);
 
 const char* wifiAuthName(wifi_auth_mode_t auth) {
   switch (auth) {
@@ -216,10 +230,13 @@ void publishAcStatus() {
 
 void publishThresholds() {
   if (!bemfaClient.connected() || strlen(BEMFA_THRESHOLD_TOPIC) == 0) return;
+  int on, off;
+  if (!legacyRuleIndexes(ruleEngine.rules, on, off)) return;
 
   char status[48];
   snprintf(status, sizeof(status), "threshold#%.1f#%.1f",
-           coolOnThresholdC, acOffThresholdC);
+           ruleEngine.rules.items[on].threshold10 / 10.0,
+           ruleEngine.rules.items[off].threshold10 / 10.0);
   bemfaClient.printf("cmd=2&uid=%s&topic=%s/up&msg=%s\r\n",
                      bemfaPrivateKey.c_str(), BEMFA_THRESHOLD_TOPIC, status);
   Serial.println("Bemfa thermostat thresholds sent");
@@ -230,6 +247,8 @@ void registerBemfaTopic() {
   topicRegistrationPending = false;
 
   HTTPClient http;
+  http.setConnectTimeout(1500);
+  http.setTimeout(2000);
   if (!http.begin("http://pro.bemfa.com/vs/web/v1/deviceAddTopic")) {
     Serial.println("Bemfa device registration could not start");
     return;
@@ -294,15 +313,16 @@ void sendOffCommand() {
   publishAcStatus();
 }
 
-void handleAcCommand(const char* payload) {
+bool handleAcCommand(const char* payload) {
   AcCommand command;
   if (!parseAcCommand(payload, command)) {
     Serial.println(
         "Invalid A/C command; use ON, OFF, COOL 26, HEAT 22, TEMP 24, AUTO, STATUS");
-    return;
+    return false;
   }
 
   const AcTransmission transmission = applyAcCommand(command, acState);
+  if (command.action == AcAction::Automatic) ruleEngine.reset();
   if (transmission == AcTransmission::On) {
     sendOnCommand();
   } else if (transmission == AcTransmission::Off) {
@@ -311,6 +331,7 @@ void handleAcCommand(const char* payload) {
     publishAcStatus();
   }
   printAcStatus();
+  return true;
 }
 
 void handleThresholdCommand(const char* payload) {
@@ -325,23 +346,41 @@ void handleThresholdCommand(const char* payload) {
     return;
   }
 
-  const float onThreshold = command.substring(first + 1, second).toFloat();
-  const float offThreshold = command.substring(second + 1).toFloat();
-  if (onThreshold < -10.0f || onThreshold > 50.0f ||
-      offThreshold < -10.0f || offThreshold > 50.0f ||
-      onThreshold <= offThreshold) {
+  const String onText = command.substring(first + 1, second);
+  const String offText = command.substring(second + 1);
+  char* onEnd;
+  char* offEnd;
+  const double onThreshold = strtod(onText.c_str(), &onEnd);
+  const double offThreshold = strtod(offText.c_str(), &offEnd);
+  if (onText.isEmpty() || offText.isEmpty() || *onEnd || *offEnd ||
+      !isfinite(onThreshold) || !isfinite(offThreshold) ||
+      onThreshold < -10 || onThreshold > 50 || offThreshold < -10 ||
+      offThreshold > 50 || onThreshold <= offThreshold ||
+      fabs(onThreshold * 10 - round(onThreshold * 10)) > 0.0001 ||
+      fabs(offThreshold * 10 - round(offThreshold * 10)) > 0.0001) {
     Serial.println("Invalid thresholds: require -10..50 C and ON > OFF");
     return;
   }
 
-  coolOnThresholdC = onThreshold;
-  acOffThresholdC = offThreshold;
-  preferences.putFloat("on", coolOnThresholdC);
-  preferences.putFloat("off", acOffThresholdC);
-  Serial.printf("Updated thresholds: ON above %.1f C, OFF below %.1f C\n",
-                coolOnThresholdC, acOffThresholdC);
+  int on, off;
+  if (!legacyRuleIndexes(ruleEngine.rules, on, off)) {
+    Serial.println("Legacy threshold rules changed or removed; configure rules on the web page");
+    return;
+  }
+  RuleSet candidate = ruleEngine.rules;
+  candidate.items[on].threshold10 = lround(onThreshold * 10);
+  candidate.items[off].threshold10 = lround(offThreshold * 10);
+  String error;
+  if (!persistRules(candidate, error)) {
+    Serial.println("Threshold save failed: " + error);
+    return;
+  }
+  Serial.printf("Updated threshold rules: ON at %.1f C, OFF at %.1f C\n",
+                onThreshold, offThreshold);
   publishThresholds();
 }
+
+#include "web_api.h"
 
 void notifyProvisionJson(JsonDocument& doc) {
   if (!bleTxCharacteristic || !bleConnected || !bleTxSubscribed) return;
@@ -698,7 +737,7 @@ void connectBemfaTcp() {
     return;
   }
 
-  if (!bemfaClient.connect(BEMFA_TCP_HOST, BEMFA_TCP_PORT)) {
+  if (!bemfaClient.connect(BEMFA_TCP_HOST, BEMFA_TCP_PORT, 1000)) {
     Serial.println("Bemfa TCP connection failed");
     if (bleConnected) {
       sendProvisionStatus(wifiProvisionSeq, "cloud_failed", 100, 2001,
@@ -765,16 +804,8 @@ void setup() {
   bemfaPrivateKey = preferences.getString("token", BEMFA_PRIVATE_KEY);
   if (bemfaPrivateKey.isEmpty()) bemfaPrivateKey = BEMFA_PRIVATE_KEY;
 
-  const float savedOnThreshold = preferences.getFloat("on", coolOnThresholdC);
-  const float savedOffThreshold = preferences.getFloat("off", acOffThresholdC);
-  if (savedOnThreshold > savedOffThreshold &&
-      savedOnThreshold >= -10.0f && savedOnThreshold <= 50.0f &&
-      savedOffThreshold >= -10.0f && savedOffThreshold <= 50.0f) {
-    coolOnThresholdC = savedOnThreshold;
-    acOffThresholdC = savedOffThreshold;
-  }
-  Serial.printf("Active thresholds: ON above %.1f C, OFF below %.1f C\n",
-                coolOnThresholdC, acOffThresholdC);
+  loadRules();
+  setupWebServer();
 
   // DHTNEW bounds pulse waits in microseconds; a missing pulse must not hold
   // interrupts off long enough to trigger the ESP32-C3 interrupt watchdog.
@@ -790,6 +821,12 @@ void setup() {
 }
 
 void loop() {
+  if (!webStarted && WiFi.status() == WL_CONNECTED) {
+    webServer.begin();
+    webStarted = true;
+    Serial.printf("Web control: http://%s/\n", WiFi.localIP().toString().c_str());
+  }
+  if (webStarted) webServer.handleClient();
   processProvisioning();
   if (cloudConnectingStatusPending && millis() >= cloudStatusDueMs) {
     cloudConnectingStatusPending = false;
@@ -818,24 +855,32 @@ void loop() {
     const float humidity = dht.getHumidity();
     const float temperature = dht.getTemperature();
 
-    if (sensorStatus != DHTLIB_OK || isnan(temperature) || isnan(humidity)) {
+    sensorError = sensorStatus;
+    sensorValid = sensorStatus == DHTLIB_OK && isfinite(temperature) &&
+                  isfinite(humidity);
+    if (!sensorValid) {
       Serial.printf("DHT read failed (%d); check sensor type and wiring\n",
                     sensorStatus);
     } else {
+      sensorHasReading = true;
+      lastValidSensorMs = millis();
+      sensorTemperatureC = temperature;
+      sensorHumidity = humidity;
       Serial.printf("Temperature: %.1f C, humidity: %.1f%%\n",
                     temperature, humidity);
 
-      if (acState.automatic) {
-        if (temperature > coolOnThresholdC &&
-            (acState.power != AcPower::On || acState.mode != AcMode::Cool ||
-             acState.temperatureC != 26)) {
-          acState.mode = AcMode::Cool;
-          acState.temperatureC = 26;
-          sendOnCommand();
-        } else if (temperature < acOffThresholdC &&
-                   acState.power != AcPower::Off) {
-          sendOffCommand();
-        }
+      const int selected = ruleEngine.evaluate(lroundf(temperature * 10),
+                                               true, acState.automatic);
+      if (selected >= 0) {
+        lastRule = ruleEngine.rules.items[selected];
+        lastRuleMs = millis();
+        hasLastRule = true;
+        const AcTransmission transmission = applyRuleAction(lastRule, acState);
+        lastRuleSent = transmission != AcTransmission::None;
+        Serial.printf("Rule #%u triggered; IR %s\n", lastRule.id,
+                      lastRuleSent ? "sending" : "unchanged, skipped");
+        if (transmission == AcTransmission::On) sendOnCommand();
+        else if (transmission == AcTransmission::Off) sendOffCommand();
       }
     }
   }
